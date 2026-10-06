@@ -71,10 +71,22 @@ A story finds its songs again by the album folder's name and the file's path ins
 them) to the new ids - save the story afterwards. A renamed folder keeps its old slug, so its story script and
 breaks still match.
 
+## One copy of each song (the file-type filter)
+
+When a folder holds the same song in two formats (`07 - Title.mp3` beside `07 - Title.wav`), a plain scan
+indexes both. `Library.scan(..., only=(".wav",))` indexes only WAVs (a song with no WAV is left out);
+`Library.scan(..., prefer=preference(".wav"))` keeps one copy per song - the WAV when there is one, otherwise
+the best other copy (lossless before lossy). Copies are "the same song" when they share a folder and a name.
+Changing the filter is safe: a copy that drops out hands its intro, transcript, summary and notes to the copy
+that stays (`ScanSummary.carried` maps the ids; `breaks.relink_breaks` moves casual intros with it), and
+`Library.track_for_path` finds the kept copy from a playlist that names the other one.
+
 ## Command line
 
 ```
 python -m aura scan "D:\Music\The Turing Accords"      index (and measure loudness with ffmpeg)
+python -m aura scan "D:\Music\The Turing Accords" --prefer wav   one copy of each song, WAV first
+python -m aura scan "D:\Music\The Turing Accords" --only wav     WAVs only
 python -m aura tracks                                  list what is indexed
 python -m aura playlist tta.m3u8 --album "The Turing Accords"
 python -m aura story-draft "D:\Music\The Turing Accords"   draft the story file (lean sheets attached)

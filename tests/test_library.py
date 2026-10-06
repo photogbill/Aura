@@ -11,8 +11,8 @@ from unittest import mock
 from aura_test_support import TempDirTest, make_wav
 
 from aura import library as L
-from aura.library import (Library, measure_loudness, parse_ebur128, parse_filename, probe_duration,
-                          split_performers, track_id_for)
+from aura.library import (Library, measure_loudness, parse_ebur128, parse_filename, preference, probe_duration,
+                          select_files, split_performers, track_id_for)
 
 # Captured from `ffmpeg -nostats -i song.mp3 -filter_complex ebur128=peak=true -f null -` (values edited).
 EBUR128_SAMPLE = """\
@@ -281,3 +281,86 @@ class ScanTests(TempDirTest):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FileTypeFilterTests(TempDirTest):
+    """Bill keeps an MP3 and a WAV of every song side by side (2026-10-05): "Is there a way to put a filter
+    that locks it to a specific user selected file type? That way, it won't get duplicates?" """
+
+    def setUp(self):
+        super().setUp()
+        self.album = self.tmp / "music" / "The Turing Accords"
+        for stem in ("01 - Genesis (Minerva)", "02 - The Velvet Lesson (Aphrodite)"):
+            make_wav(self.album / f"{stem}.wav")
+            (self.album / f"{stem}.mp3").write_bytes(b"ID3\x03\x00\x00\x00\x00\x00\x00")
+        make_wav(self.album / "03 - Only A Wav.wav")
+        (self.album / "04 - Only An Mp3.mp3").write_bytes(b"ID3\x03\x00\x00\x00\x00\x00\x00")
+        self.lib = Library(self.tmp / "data", ffmpeg=None)
+        self.addCleanup(self.lib.close)
+
+    def _exts(self):
+        return sorted(os.path.splitext(t.path)[1] for t in self.lib.tracks())
+
+    def test_select_files_only_and_prefer(self):
+        files = [str(p) for p in sorted(self.album.iterdir())]
+        only = select_files(files, only=("wav",))
+        self.assertEqual([os.path.splitext(p)[1] for p in only], [".wav", ".wav", ".wav"])
+        one_each = select_files(files, prefer=preference(".wav"))
+        self.assertEqual(len(one_each), 4)                         # four songs, one copy each
+        self.assertEqual(sorted(os.path.basename(p) for p in one_each), [
+            "01 - Genesis (Minerva).wav", "02 - The Velvet Lesson (Aphrodite).wav",
+            "03 - Only A Wav.wav", "04 - Only An Mp3.mp3"])          # the mp3-only song is still kept
+        mp3_first = select_files(files, prefer=preference("MP3"))
+        self.assertIn(str(self.album / "01 - Genesis (Minerva).mp3"), mp3_first)
+        self.assertNotIn(str(self.album / "01 - Genesis (Minerva).wav"), mp3_first)
+        self.assertEqual(select_files(files), files)                # no filter: everything, in order
+
+    def test_copies_in_different_folders_are_different_songs(self):
+        other = self.tmp / "music" / "Live"
+        make_wav(other / "01 - Genesis (Minerva).wav")
+        files = [str(self.album / "01 - Genesis (Minerva).wav"), str(other / "01 - Genesis (Minerva).wav")]
+        self.assertEqual(select_files(files, prefer=preference(".wav")), files)
+
+    def test_without_a_filter_every_song_is_there_twice(self):
+        self.lib.scan(self.tmp / "music")
+        self.assertEqual(len(self.lib.tracks()), 6)
+
+    def test_only_wav_leaves_the_mp3s_out(self):
+        summary = self.lib.scan(self.tmp / "music", only=(".wav",))
+        self.assertEqual((summary.found, summary.skipped, summary.added), (6, 3, 3))
+        self.assertEqual(self._exts(), [".wav", ".wav", ".wav"])
+
+    def test_prefer_keeps_one_copy_of_every_song(self):
+        summary = self.lib.scan(self.tmp / "music", prefer=preference(".wav"))
+        self.assertEqual((summary.found, summary.skipped, summary.added), (6, 2, 4))
+        self.assertEqual(self._exts(), [".mp3", ".wav", ".wav", ".wav"])
+
+    def test_switching_types_moves_the_work_to_the_copy_that_stays(self):
+        self.lib.scan(self.tmp / "music")
+        mp3 = self.lib.track(track_id_for(self.album / "01 - Genesis (Minerva).mp3"))
+        self.lib.update(mp3.id, notes="the AI wakes in orbit", intro_s=12.5,
+                        summary="Minerva wakes.", transcript_path="t.json")
+        summary = self.lib.scan(self.tmp / "music", only=(".wav",))
+        wav_id = track_id_for(self.album / "01 - Genesis (Minerva).wav")
+        self.assertEqual(summary.carried.get(mp3.id), wav_id)
+        self.assertIsNone(self.lib.track(mp3.id))                   # the mp3 copy left the library...
+        wav = self.lib.track(wav_id)
+        self.assertEqual((wav.notes, wav.intro_s, wav.intro_source, wav.summary, wav.summary_source,
+                          wav.transcript_path),
+                         ("the AI wakes in orbit", 12.5, "manual", "Minerva wakes.", "manual", "t.json"))
+
+    def test_a_kept_copys_own_work_is_never_overwritten(self):
+        self.lib.scan(self.tmp / "music")
+        mp3_id = track_id_for(self.album / "01 - Genesis (Minerva).mp3")
+        wav_id = track_id_for(self.album / "01 - Genesis (Minerva).wav")
+        self.lib.update(mp3_id, notes="old note")
+        self.lib.update(wav_id, notes="the note on the wav")
+        self.lib.scan(self.tmp / "music", only=(".wav",))
+        self.assertEqual(self.lib.track(wav_id).notes, "the note on the wav")
+
+    def test_a_path_to_a_left_out_copy_finds_the_kept_one(self):
+        self.lib.scan(self.tmp / "music", only=(".wav",))
+        found = self.lib.track_for_path(self.album / "02 - The Velvet Lesson (Aphrodite).mp3")
+        self.assertIsNotNone(found)
+        self.assertTrue(found.path.endswith(".wav"))
+        self.assertIsNone(self.lib.track_for_path(self.album / "99 - Nothing.mp3"))

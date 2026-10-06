@@ -68,6 +68,64 @@ class ScanSummary:
     unchanged: int = 0
     removed: int = 0
     failed: list[str] = field(default_factory=list)
+    skipped: int = 0                     # audio files the file-type filter left out
+    carried: dict[str, str] = field(default_factory=dict)   # old track id -> the copy that took its place
+
+
+#: When one song is in a folder in several formats, which copy is the better one to keep when the operator's
+#: preferred type is not there: lossless first, then the lossy ones.
+QUALITY_ORDER = (".wav", ".flac", ".m4a", ".ogg", ".opus", ".mp3")
+
+
+def norm_ext(ext: str) -> str:
+    """"WAV", "wav", ".Wav" -> ".wav"."""
+    ext = str(ext or "").strip().lower()
+    return ext if ext.startswith(".") or not ext else "." + ext
+
+
+def preference(ext: str) -> tuple[str, ...]:
+    """The order to keep copies in when `ext` is preferred: `ext`, then the rest by QUALITY_ORDER."""
+    first = norm_ext(ext)
+    rest = [e for e in QUALITY_ORDER if e != first] + [e for e in AUDIO_EXTS if e not in QUALITY_ORDER and e != first]
+    return (first, *rest)
+
+
+def _song_key(path: str) -> tuple[str, str]:
+    """Two files are copies of one song when they sit in the same folder under the same name."""
+    folder, name = os.path.split(path)
+    return os.path.normcase(os.path.abspath(folder)), os.path.splitext(name)[0].casefold()
+
+
+def select_files(paths: list[str], *, only: Any = None, prefer: Any = None) -> list[str]:
+    """The files a scan indexes, in their original order.
+
+    only:   extensions to accept (e.g. (".wav",)); every other type is left out, even a song that exists in
+            no other format - that is what "only" means.
+    prefer: an order of extensions (e.g. preference(".wav")); of the copies of one song (same folder, same
+            name), only the most preferred is kept, so a folder holding both "07 - X.mp3" and "07 - X.wav"
+            gives ONE track, and a song that exists in one format only is still kept.
+    Both may be given: `only` filters first. PURE.
+    """
+    kept = list(paths)
+    if only:
+        allowed = {norm_ext(e) for e in ([only] if isinstance(only, str) else only)}
+        kept = [p for p in kept if os.path.splitext(p)[1].lower() in allowed]
+    if prefer:
+        order = [norm_ext(e) for e in ([prefer] if isinstance(prefer, str) else prefer)]
+
+        def rank(p: str) -> int:
+            ext = os.path.splitext(p)[1].lower()
+            return order.index(ext) if ext in order else len(order) + (
+                QUALITY_ORDER.index(ext) if ext in QUALITY_ORDER else len(QUALITY_ORDER))
+
+        best: dict[tuple[str, str], str] = {}
+        for p in kept:
+            key = _song_key(p)
+            if key not in best or rank(p) < rank(best[key]):
+                best[key] = p
+        winners = set(best.values())
+        kept = [p for p in kept if p in winners]
+    return kept
 
 
 # Fields the host may change through Library.update(). id, path, root, size and mtime belong to the scan.
@@ -461,7 +519,7 @@ class Library:
     # ------------------------------------------------------------------------------------------- scanning
 
     def scan(self, root: str | os.PathLike, *, progress: Optional[Callable[[str], Any]] = None,
-             cancel: Any = None, measure: bool = True) -> ScanSummary:
+             cancel: Any = None, measure: bool = True, only: Any = None, prefer: Any = None) -> ScanSummary:
         """Index every audio file under `root` (recursively).
 
         A file whose size and mtime are unchanged keeps its row. Tags come from tinytag when importable.
@@ -469,13 +527,21 @@ class Library:
         never overwritten by a scan. Rows for files under `root` that have gone are removed, but only when
         the scan ran to the end: a cancelled scan has not seen every file. `cancel` is Event-like (is_set())
         or a zero-argument callable; `progress(str)` gets one line per file.
+
+        `only` / `prefer` are the file-type filter (see select_files) - Bill keeps an MP3 and a WAV of every
+        song side by side, and without a filter each song was in the library twice. A copy the filter now
+        leaves out drops out of the library like a deleted file, but what was done to it is not lost: its
+        intro, transcript, summary and notes move to the copy that stays (summary.carried maps the old track
+        id to the new one, so the host can move breaks keyed by it too - breaks.relink_breaks).
         """
         root_abs = os.path.abspath(os.fspath(root))
         if not os.path.isdir(root_abs):
             raise NotADirectoryError(f"not a folder: {root_abs}")
         summary = ScanSummary()
-        files = self._find_audio(root_abs)
-        summary.found = len(files)
+        found = self._find_audio(root_abs)
+        files = select_files(found, only=only, prefer=prefer)
+        summary.found = len(found)
+        summary.skipped = len(found) - len(files)
         seen: set[str] = set()
         for i, path in enumerate(files, 1):
             if is_cancelled(cancel):
@@ -490,10 +556,45 @@ class Library:
                 summary.failed.append(f"{path} ({exc})")
                 continue
             setattr(summary, outcome, getattr(summary, outcome) + 1)
+        summary.carried = self._carry_to_kept_copies(root_abs, seen, files)
         summary.removed = self._remove_unseen(root_abs, seen)
-        say(progress, f"Scan finished: {summary.found} found, {summary.added} added, {summary.updated} updated, "
-                      f"{summary.unchanged} unchanged, {summary.removed} removed, {len(summary.failed)} failed.")
+        left_out = f" ({summary.skipped} left out by the file-type filter)" if summary.skipped else ""
+        say(progress, f"Scan finished: {summary.found} found{left_out}, {summary.added} added, "
+                      f"{summary.updated} updated, {summary.unchanged} unchanged, {summary.removed} removed, "
+                      f"{len(summary.failed)} failed.")
         return summary
+
+    def _carry_to_kept_copies(self, root: str, seen: set[str], kept: list[str]) -> dict[str, str]:
+        """Before rows the scan no longer sees are removed: when one of them is another copy of a song that
+        WAS kept (same folder, same name), move its hand-set and ingest fields onto the kept copy wherever the
+        kept copy has none of its own. Returns {old id: new id}."""
+        by_song = {_song_key(p): track_id_for(p) for p in kept}
+        mapping: dict[str, str] = {}
+        with self._lock:
+            for old in self.tracks():
+                if old.id in seen or not is_under(old.path, root):
+                    continue
+                new_id = by_song.get(_song_key(old.path))
+                if not new_id or new_id == old.id:
+                    continue
+                new = self.track(new_id)
+                if new is None:
+                    continue
+                moves: dict[str, Any] = {}
+                if old.intro_s is not None and (new.intro_s is None or
+                                                (old.intro_source == "manual" and new.intro_source != "manual")):
+                    moves.update(intro_s=old.intro_s, intro_source=old.intro_source)
+                if old.transcript_path and not new.transcript_path:
+                    moves["transcript_path"] = old.transcript_path
+                if old.summary_source and (not new.summary_source or
+                                           (old.summary_source == "manual" and new.summary_source != "manual")):
+                    moves.update(summary=old.summary, summary_source=old.summary_source)
+                if old.notes and not new.notes:
+                    moves["notes"] = old.notes
+                if moves:
+                    self._save(replace(new, **moves))
+                mapping[old.id] = new_id
+        return mapping
 
     def _find_audio(self, root: str) -> list[str]:
         found: list[str] = []
@@ -584,6 +685,19 @@ class Library:
             result = [t for t in result if t.album == album]
         result.sort(key=_order_key)
         return result
+
+    def track_for_path(self, path: str | os.PathLike) -> Track | None:
+        """The track at `path`, or - when that copy is not in the library (the file-type filter left it
+        out) - another copy of the same song: same folder, same name, any audio type. So a playlist saved
+        with the MP3s still plays after the library switched to the WAVs."""
+        exact = self.track(track_id_for(path))
+        if exact is not None:
+            return exact
+        key = _song_key(os.fspath(path))
+        for t in self.tracks():
+            if _song_key(t.path) == key:
+                return t
+        return None
 
     def track(self, track_id: str) -> Track | None:
         with self._lock:

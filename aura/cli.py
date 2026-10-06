@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: LicenseRef-All-Rights-Reserved
 """Command line, for using and checking the engine without ATK:
 
-    python -m aura scan <folder> [--data DIR] [--ffmpeg PATH] [--no-measure]
+    python -m aura scan <folder> [--data DIR] [--ffmpeg PATH] [--no-measure] [--only wav | --prefer wav]
     python -m aura tracks [--album NAME]
     python -m aura playlist <out.m3u8> [--album NAME]
     python -m aura story-draft <album_root>
@@ -20,7 +20,7 @@ from typing import Callable
 
 from . import __version__
 from .common import read_text
-from .library import Library
+from .library import Library, preference
 from .playlist import playlists_dir, write_m3u8
 from .script import STATUSES, lint_script, parse_script, refresh_status
 from .story import STORY_PACK_NAME, attach_sheets, draft_story, save_story, story_path
@@ -48,7 +48,12 @@ def cmd_scan(args: argparse.Namespace, data: Path) -> int:
     if not ffmpeg:
         print("ffmpeg not found: no loudness measurement; lengths come from tags or WAV headers only.")
     with Library(data, ffmpeg) as lib:
-        summary = lib.scan(args.folder, progress=print, measure=not args.no_measure)
+        only = (args.only,) if args.only else None
+        prefer = preference(args.prefer) if args.prefer else None
+        summary = lib.scan(args.folder, progress=print, measure=not args.no_measure, only=only, prefer=prefer)
+        if summary.carried:
+            from .breaks import BreakStore, relink_breaks
+            relink_breaks(BreakStore(data), summary.carried)
     for failure in summary.failed:
         print(f"FAILED: {failure}")
     return 0
@@ -150,6 +155,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("scan", parents=[common], help="index the audio files under a folder")
     p.add_argument("folder")
     p.add_argument("--no-measure", action="store_true", help="skip loudness measurement (much faster)")
+    kind = p.add_mutually_exclusive_group()
+    kind.add_argument("--only", metavar="TYPE", help="index only this file type, e.g. wav")
+    kind.add_argument("--prefer", metavar="TYPE",
+                      help="one copy per song: this type when a song has it, else the best other copy")
     p = sub.add_parser("tracks", parents=[common], help="list indexed tracks")
     p.add_argument("--album", help="only this album (exact name, as listed)")
     p.add_argument("--root", help="only tracks under this folder")

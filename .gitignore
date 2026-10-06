@@ -4,3 +4,7 @@ __pycache__/
 *.pyc
 .*.tmp
 .git-commit-message.txt
+# made by `pip install -e .` (get_engines.bat /aura): build output, not source
+*.egg-info/
+build/
+dist/
