@@ -1,0 +1,161 @@
+Here is the comprehensive build plan for the **Autonomous Radio & Relief Assistant (AURA)** submodule. This acts as a self-contained Python package that can be dropped into your wider toolkit, operating as a standalone EmComm gateway, translator, and Phantom DJ.
+
+---
+
+# Build Plan: AURA Submodule
+
+**Autonomous Radio & Relief Assistant**
+
+## 1. Submodule Tech Stack & Resource Allocation
+
+Since this runs on your RTX 3080 Ti (16 GB VRAM) and 64 GB RAM, we budget the pipelines carefully to avoid OOM crashes during asynchronous interrupts.
+
+* **Messaging Bus:** `signal-cli` (JSON-RPC mode) + ZeroMQ for inter-process communication.
+* **Reasoning & Vision Core:** `llama-cpp-python`.
+* *Logic:* 8B-class Q5_K_M GGUF (e.g., Llama 3 or Qwen).
+* *Vision:* `mmproj` adapter loaded dynamically only when Signal ingests an image.
+
+
+* **Audio DSP & TTS:** `Piper-TTS` (ONNX on CPU), `whisper.cpp` (Medium model), `PyDub` for ducking/mixing, `SciPy` for filters.
+* **SDR Backend:** `SoapySDR` with Python bindings (for RX squelch monitoring and TX WBFM/NFM streaming).
+
+---
+
+## Phase 1: The Secure Signal Gateway
+
+This is the command-and-control (C2) bridge that completely isolates the LLM from the open internet.
+
+1. **Daemonization:** Run `signal-cli` in continuous JSON-RPC mode bound to `localhost:7583`.
+2. **The Bouncer (`signal_router.py`):**
+* Reads the `envelope.sourceUuid`. If it doesn't match your predefined admin UUID, the packet is silently dropped.
+* **Attachment Handler:** If a message contains an image, it saves the file to `/tmp/aura_media/`.
+
+
+3. **Command vs. Natural Language Routing:**
+* Prefixes like `CONFIG_POWER` or `ANNOUNCE:` trigger immediate rigid python functions.
+* Standard conversational text or translation requests are routed into the LLM inference queue.
+
+
+
+---
+
+## Phase 2: The Cognitive & Multimodal Engine
+
+This layer wraps `llama.cpp` and provides the visual and translational reasoning.
+
+1. **Dynamic VLM Loading:**
+* When the Signal gateway saves an image (e.g., a photo of a damaged antenna or a foreign warning sign), the engine checks for the active `mmproj` adapter.
+* It passes the image path + user prompt to the VLM, generates the diagnostic or translation, and routes the text back to the Signal bridge.
+
+
+2. **In-Field Translation Agent:**
+* If you text: *"Translate: [foreign text]"*, the LLM uses a zero-shot prompt to convert it to English.
+* Conversely, if the SDR records an incoming voice transmission, `whisper.cpp` transcribes it. If Whisper detects a non-English language, the text is automatically pushed to the LLM to translate before texting you the result.
+
+
+
+---
+
+## Phase 3: The "Phantom DJ" Playout Deck
+
+This handles continuous, low-power WBFM camp broadcasting using your local music folders (e.g., the *Genesis of the Machine Gods* rock opera).
+
+1. **Metadata & Lore Ingestion:**
+* The module watches a designated music directory.
+* It parses MP3/FLAC ID3 tags (Track #, Title) via the `mutagen` library.
+* It looks for an `album_lore.md` file in the folder to understand the narrative arc (e.g., the AI core's awakening in orbit).
+
+
+2. **Voice-Tracking Generator:**
+* While Track 1 is playing, the LLM reads the lore for Track 1 and Track 2, generating a 50-word DJ script bridging the story elements.
+* `Piper-TTS` renders this script to a 16 kHz WAV file.
+
+
+3. **The Mixing Board (`audio_mixer.py`):**
+* Uses PyDub to apply broadcast EQ (slight mid-boost, high-pass at 120Hz) to the TTS voice.
+* Overlays the voice track onto an instrumental "intro bed," ducking the bed volume by -14 dB while the DJ speaks.
+* Crossfades the DJ break seamlessly into the intro of Track 2.
+
+
+
+---
+
+## Phase 4: Polyglot Preemption & Priority Interrupts
+
+This handles the asynchronous camp-wide announcements triggered via Signal.
+
+1. **Interrupt Trigger:**
+* Signal receives: `ANNOUNCE: Supply truck arriving at Gate 3`.
+
+
+2. **Language Matrix Processing:**
+* The system reads the user-configured language checkboxes (e.g., English, Spanish, Ukrainian).
+* The LLM loops through the active non-English languages, generating translated scripts.
+* `Piper-TTS` renders each language using its respective native ONNX model.
+
+
+3. **Audio Sequencer:**
+* Stitches the audio: `[2-Tone Alert Chime] -> [EN Voice] -> [Soft Pip] -> [ES Voice] -> [Soft Pip] -> [UK Voice]`.
+
+
+4. **Live Ducking:**
+* The WBFM streaming thread is interrupted. The currently playing rock opera track is softly faded down by 20 dB.
+* The emergency sequence is piped directly into the SDR transmit buffer.
+* Once complete, the music softly fades back up, and a Signal message confirms delivery to your phone.
+
+
+
+---
+
+## Phase 5: Hardware Abstraction & RF Safety Interlocks
+
+Because RF hardware is involved, the software cannot be allowed to hallucinate TX commands.
+
+1. **Power Configuration Profiles (`rf_config.json`):**
+* A JSON schema dictates hardware limits.
+* *Profiles:* `BENCH_TEST` (0 dB gain, dummy load), `CAMP_LOCAL` (20 dB gain), `RELIEF_WIDE` (45 dB gain + GPIO trigger for an external PA).
+* Signal commands like `SET_POWER CAMP_LOCAL` update the active profile in RAM.
+
+
+2. **WBFM & NFM DSP Chains:**
+* *For the DJ Station (WBFM):* Applies 75 µs pre-emphasis to the full music audio buffer, interpolates to 2 MSps, frequency modulates at ±75 kHz deviation, and streams to the HackRF.
+* *For Emergency Simplex (NFM):* Applies a strict 300–3000 Hz bandpass filter to voice audio, hard limiter, modulates at ±2.5 kHz deviation.
+
+
+3. **Safety Interlocks:**
+* **Time-Out Timer (TOT):** A C++ or Python thread watchdog that physically unkeys the transmitter if the buffer runs continuously for more than 45 seconds (for NFM) or beyond the duration of the playlist.
+* **Frequency Whitelist:** TX commands are clamped. If the LLM somehow attempts to route an announcement to an aviation or unauthorized public safety band, the HAL throws an exception and drops the request.
+
+
+
+---
+
+## Phase 6: GUI Configuration Panel (PySide6)
+
+To integrate this submodule into your existing desktop application, we build a dedicated PySide6 Tab: **AURA Control**.
+
+1. **Language Grid:**
+* A `QGroupBox` containing a grid of `QCheckBox` widgets (English, Spanish, French, Arabic, etc.). Checking these instantly updates the polyglot orchestrator's active array.
+
+
+2. **Power & Hardware Panel:**
+* A `QComboBox` to select the RF Power Profile (Bench, Camp, Disaster).
+* A `QSlider` mapping to SDR TX Gain (0–47 dB) with a red warning zone above 35 dB.
+* A visual LED indicator (`QRadioButton` styled via QSS) that turns RED when the transmitter is actively keyed.
+
+
+3. **Media & DJ Control:**
+* A `QLineEdit` folder browser to select the current MP3/FLAC directory.
+* A `QTextEdit` displaying the currently loaded `album_lore.md` for the DJ.
+* A live scrolling log showing transcribed Whisper intercepts and Signal LLM translations.
+
+
+
+## Suggested Execution Order
+
+1. Build the Signal-to-Python loopback bridge. Verify you can text the script and it can text you back.
+2. Build the PyDub audio sequencer. Ensure you can stitch a TTS voice, a chime, and crossfade into an MP3.
+3. Hook the audio sequencer output into the SoapySDR TX stream (test with a dummy load).
+4. Integrate `llama-cpp-python` for the DJ persona and language translation.
+5. Build the PySide6 UI to control the configuration JSON dynamically.
+6. A Music Folder ingestion feature that utilizes whisper large V3 to create transcripts of every song, which will prebuild summaries of each for the llm to utilize when constructing its comments. That way, the comments can creatively change for the same song while not using the wrong information. Since the ingestion will take awhile, that is understood.  The file names may optionally have the individual performing in (  )  like (Valkyrie).  That will hold true for most of my rock opera, if not the early songs. We'll use the rock opera as a test.  

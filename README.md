@@ -62,6 +62,15 @@ The words the host will say.
 - Keep your own notes in a `=== notes:anything` block; they are never rendered or aired.
 - The ids count story tracks from 0: `segue:<album>:3` is the segue after the 4th song (the label says so).
 
+## Moving an album folder
+
+Track ids come from each file's full path, so moving or renaming an album folder gives its songs new ids.
+A story finds its songs again by the album folder's name and the file's path inside it (or a unique file name):
+`Show` does this in memory, `load_story(path, library=lib)` on loading, and
+`relink_story(story, lib, store=store)` also renames the casual intros/back-announces (and your own takes for
+them) to the new ids - save the story afterwards. A renamed folder keeps its old slug, so its story script and
+breaks still match.
+
 ## Command line
 
 ```
@@ -106,4 +115,3 @@ Standard library `unittest` only; no network, no GPU, no ffmpeg needed (all serv
 ## Licence
 
 All rights reserved - see `LICENSE`.
-"# Aura" 

@@ -1,0 +1,6 @@
+# Bill's library, transcripts, scripts and rendered audio live here when the CLI is used: never commit them
+data/
+__pycache__/
+*.pyc
+.*.tmp
+.git-commit-message.txt

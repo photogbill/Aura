@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aura"
+version = "0.1.0"
+description = "AURA's media player core: music library, pre-recorded radio host and show sequencer (stdlib only)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "William R. Duncan" }]
+dependencies = []
+
+[project.optional-dependencies]
+tags = ["tinytag>=2"]
+
+[tool.setuptools.packages.find]
+include = ["aura*"]
