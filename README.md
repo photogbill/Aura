@@ -81,6 +81,34 @@ Changing the filter is safe: a copy that drops out hands its intro, transcript, 
 that stays (`ScanSummary.carried` maps the ids; `breaks.relink_breaks` moves casual intros with it), and
 `Library.track_for_path` finds the kept copy from a playlist that names the other one.
 
+## Music sources (what the library is made of)
+
+`aura.sources` keeps the library as rules: a folder (this folder only unless `subfolders` is on, chosen per
+folder), the file types to take from it, one copy per song or every copy; or one song on its own. `sync` scans
+every rule in one run and removes only what a rule that is there no longer takes: a source that is not there
+(a USB stick not plugged in) is skipped and nothing of it is removed. Overlapping rules are allowed; a song is
+indexed once. `SourceSet` is the browser's working copy (what a click does, how each folder and file shows).
+
+## RouteNote copies
+
+`aura.convert` makes delivery copies of WAV masters: stereo FLAC, 16-bit, 44.1 kHz (RouteNote's spec), SoX
+resampler and triangular dither when needed, mono copied to both sides at the same level, each copy checked
+against the spec after writing, a true peak over 0 dBFS reported (never turned down). Organized as
+`<out>/<album>/[Disc N/]<song>.flac`; the masters are never touched; copies newer than their WAV are kept.
+
+## Playlist packages (taking the work to another machine)
+
+`aura.bundle` writes one `.aura.zip` holding a playlist and everything made for its songs: transcripts,
+summaries, intro lengths, notes, the host's breaks with their audio (converted to MP3 by FFmpeg), Bill's own
+takes, the album stories, and `liner_notes.html`, a page anyone can open in a browser. The songs are not in it.
+
+Track ids are file paths, so import first finds each song in the receiving library: the same bytes, then the
+same song in another file type (the MP3 machine picks up what was made on the WAVs), then the same file name,
+then the same album and title. Ambiguous is never guessed. Break audio goes straight into `data/breaks` under
+the receiving machine's ids. "fill" (the default) keeps everything already there; "replace" lets the package
+win. Bill's own takes and story packs are never overwritten. Importing again after scanning missing songs is
+safe. Breaks air only in the voice they were rendered in, so the receiving machine's host voice must match.
+
 ## Command line
 
 ```
@@ -91,6 +119,10 @@ python -m aura tracks                                  list what is indexed
 python -m aura playlist tta.m3u8 --album "The Turing Accords"
 python -m aura story-draft "D:\Music\The Turing Accords"   draft the story file (lean sheets attached)
 python -m aura script-check the-turing-accords         statuses, stale breaks, problems
+python -m aura export "Field Set 1" --album "The Turing Accords"   playlist package (no songs in it)
+python -m aura routenote "D:\Music\The Turing Accords" --out D:\RouteNote --subfolders
+python -m aura import "Field Set 1.aura.zip" --dry-run   which songs it finds here, and how
+python -m aura import "Field Set 1.aura.zip"            bring the work in (--replace: the package wins)
 ```
 
 Every command takes `--data DIR`, `--ffmpeg PATH` and `--no-ffmpeg`.

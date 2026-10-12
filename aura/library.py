@@ -19,7 +19,7 @@ import threading
 import wave
 from dataclasses import asdict, dataclass, field, fields, replace
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Iterator, Optional
 
 from .common import is_cancelled, is_under, say
 
@@ -70,6 +70,7 @@ class ScanSummary:
     failed: list[str] = field(default_factory=list)
     skipped: int = 0                     # audio files the file-type filter left out
     carried: dict[str, str] = field(default_factory=dict)   # old track id -> the copy that took its place
+    unavailable: list[str] = field(default_factory=list)    # sources not there right now: skipped, nothing removed
 
 
 #: When one song is in a folder in several formats, which copy is the better one to keep when the operator's
@@ -432,6 +433,32 @@ def _skip_dir(name: str) -> bool:
     return name.startswith((".", "$")) or name.casefold() == "system volume information"
 
 
+def walk_audio(root: str | os.PathLike, *, subfolders: bool = True, skip_under: Any = None
+               ) -> Iterator[tuple[str, list[str]]]:
+    """(folder, [audio file names in it]) for `root` and - only when `subfolders` - every folder below it, in
+    a stable order. Hidden and system folders ("." / "$" / System Volume Information) are never entered, nor
+    anything under `skip_under` (AURA's own data folder: its rendered breaks are not songs)."""
+    top = os.path.abspath(os.fspath(root))
+    skip = os.path.abspath(os.fspath(skip_under)) if skip_under else None
+
+    def on_error(err: OSError) -> None:
+        log.warning("cannot read folder %s: %s", getattr(err, "filename", "?"), err)
+
+    for dirpath, dirnames, filenames in os.walk(top, onerror=on_error):
+        dirnames[:] = sorted((d for d in dirnames if not _skip_dir(d)
+                              and not (skip and is_under(os.path.join(dirpath, d), skip))), key=str.casefold)
+        yield dirpath, [n for n in sorted(filenames, key=str.casefold)
+                        if not n.startswith("._") and os.path.splitext(n)[1].lower() in AUDIO_EXTS]
+        if not subfolders:
+            break
+
+
+def find_audio(root: str | os.PathLike, *, subfolders: bool = True, skip_under: Any = None) -> list[str]:
+    """Every audio file in `root` - and below it only when `subfolders` (see walk_audio)."""
+    return [os.path.join(folder, name) for folder, names in walk_audio(root, subfolders=subfolders,
+                                                                       skip_under=skip_under) for name in names]
+
+
 def _album_folder_name(path: str) -> str:
     """The album name a folder implies: the parent folder, or the one above a "Disc 2"-style folder."""
     parent = os.path.dirname(path)
@@ -519,8 +546,9 @@ class Library:
     # ------------------------------------------------------------------------------------------- scanning
 
     def scan(self, root: str | os.PathLike, *, progress: Optional[Callable[[str], Any]] = None,
-             cancel: Any = None, measure: bool = True, only: Any = None, prefer: Any = None) -> ScanSummary:
-        """Index every audio file under `root` (recursively).
+             cancel: Any = None, measure: bool = True, only: Any = None, prefer: Any = None,
+             subfolders: bool = True) -> ScanSummary:
+        """Index every audio file under `root` (and the folders below it, unless subfolders=False).
 
         A file whose size and mtime are unchanged keeps its row. Tags come from tinytag when importable.
         Fields a person set (intro_source "manual", summary_source "manual", notes) and ingest results are
@@ -533,38 +561,65 @@ class Library:
         leaves out drops out of the library like a deleted file, but what was done to it is not lost: its
         intro, transcript, summary and notes move to the copy that stays (summary.carried maps the old track
         id to the new one, so the host can move breaks keyed by it too - breaks.relink_breaks).
+
+        Several folders with their own rules (Bill's music browser) go through sources.sync instead.
         """
         root_abs = os.path.abspath(os.fspath(root))
         if not os.path.isdir(root_abs):
             raise NotADirectoryError(f"not a folder: {root_abs}")
-        summary = ScanSummary()
-        found = self._find_audio(root_abs)
+        found = find_audio(root_abs, subfolders=subfolders, skip_under=self.data_dir)
         files = select_files(found, only=only, prefer=prefer)
-        summary.found = len(found)
-        summary.skipped = len(found) - len(files)
+        if subfolders:
+            def in_scope(path: str) -> bool:
+                return is_under(path, root_abs)
+        else:
+            home = os.path.normcase(root_abs)
+
+            def in_scope(path: str) -> bool:
+                return os.path.normcase(os.path.dirname(os.path.abspath(path))) == home
+        return self.index([(path, root_abs) for path in files], in_scope=in_scope, found=len(found),
+                          progress=progress, cancel=cancel, measure=measure)
+
+    def index(self, entries: list[tuple[str, str]], *, in_scope: Callable[[str], bool], found: int | None = None,
+              progress: Optional[Callable[[str], Any]] = None, cancel: Any = None,
+              measure: bool = True) -> ScanSummary:
+        """Index exactly these files - (path, root) pairs, root being the folder of the rule that chose the
+        file - and, when the run reaches the end, remove the rows `in_scope` says this run was responsible for
+        but did not see (deleted files, copies a filter now leaves out), after moving their hand-set and
+        ingest fields to the copy that stays. Rows outside the scope are never touched. `found` is how many
+        audio files the rules saw before their filters (for the summary)."""
+        summary = ScanSummary()
+        files = [path for path, _root in entries]
+        summary.found = len(files) if found is None else found
+        summary.skipped = max(0, summary.found - len(files))
         seen: set[str] = set()
-        for i, path in enumerate(files, 1):
+        for i, (path, root) in enumerate(entries, 1):
             if is_cancelled(cancel):
-                say(progress, f"Scan cancelled after {i - 1} of {len(files)} files; nothing was removed.")
+                say(progress, f"Scan cancelled after {i - 1} of {len(entries)} files; nothing was removed.")
                 return summary
-            say(progress, f"[{i}/{len(files)}] {os.path.basename(path)}")
+            say(progress, f"[{i}/{len(entries)}] {os.path.basename(path)}")
             seen.add(track_id_for(path))  # seen even if it fails: a read error must not delete Bill's notes
             try:
-                outcome = self._scan_one(path, root_abs, measure)
+                outcome = self._scan_one(path, os.path.abspath(root), measure)
             except Exception as exc:  # noqa: BLE001 - one unreadable file never stops the scan
                 log.warning("could not index %s: %s", path, exc)
                 summary.failed.append(f"{path} ({exc})")
                 continue
             setattr(summary, outcome, getattr(summary, outcome) + 1)
-        summary.carried = self._carry_to_kept_copies(root_abs, seen, files)
-        summary.removed = self._remove_unseen(root_abs, seen)
+        summary.carried = self._carry_to_kept_copies(in_scope, seen, files)
+        summary.removed = self._remove_unseen(in_scope, seen)
         left_out = f" ({summary.skipped} left out by the file-type filter)" if summary.skipped else ""
         say(progress, f"Scan finished: {summary.found} found{left_out}, {summary.added} added, "
                       f"{summary.updated} updated, {summary.unchanged} unchanged, {summary.removed} removed, "
                       f"{len(summary.failed)} failed.")
+        log.info("scan: %d found, %d indexed (%d added, %d updated, %d unchanged), %d left out by filters, "
+                 "%d removed, %d carried to the copy that stays, %d failed", summary.found, len(entries),
+                 summary.added, summary.updated, summary.unchanged, summary.skipped, summary.removed,
+                 len(summary.carried), len(summary.failed))
         return summary
 
-    def _carry_to_kept_copies(self, root: str, seen: set[str], kept: list[str]) -> dict[str, str]:
+    def _carry_to_kept_copies(self, in_scope: Callable[[str], bool], seen: set[str],
+                              kept: list[str]) -> dict[str, str]:
         """Before rows the scan no longer sees are removed: when one of them is another copy of a song that
         WAS kept (same folder, same name), move its hand-set and ingest fields onto the kept copy wherever the
         kept copy has none of its own. Returns {old id: new id}."""
@@ -572,7 +627,7 @@ class Library:
         mapping: dict[str, str] = {}
         with self._lock:
             for old in self.tracks():
-                if old.id in seen or not is_under(old.path, root):
+                if old.id in seen or not in_scope(old.path):
                     continue
                 new_id = by_song.get(_song_key(old.path))
                 if not new_id or new_id == old.id:
@@ -597,20 +652,7 @@ class Library:
         return mapping
 
     def _find_audio(self, root: str) -> list[str]:
-        found: list[str] = []
-        data_dir = os.path.abspath(self.data_dir)
-
-        def on_error(err: OSError) -> None:
-            log.warning("cannot read folder %s: %s", getattr(err, "filename", "?"), err)
-
-        for dirpath, dirnames, filenames in os.walk(root, onerror=on_error):
-            # never index our own rendered breaks if Bill points a scan at a folder holding data_dir
-            dirnames[:] = sorted((d for d in dirnames if not _skip_dir(d)
-                                  and not is_under(os.path.join(dirpath, d), data_dir)), key=str.casefold)
-            for name in sorted(filenames, key=str.casefold):
-                if not name.startswith("._") and os.path.splitext(name)[1].lower() in AUDIO_EXTS:
-                    found.append(os.path.join(dirpath, name))
-        return found
+        return find_audio(root, subfolders=True, skip_under=self.data_dir)
 
     def _scan_one(self, path: str, root: str, measure: bool) -> str:
         """Index one file; returns "added", "updated" or "unchanged".
@@ -663,8 +705,8 @@ class Library:
             size=st.st_size, mtime=st.st_mtime,
         )
 
-    def _remove_unseen(self, root: str, seen: set[str]) -> int:
-        gone = [t.id for t in self.tracks() if t.id not in seen and is_under(t.path, root)]
+    def _remove_unseen(self, in_scope: Callable[[str], bool], seen: set[str]) -> int:
+        gone = [t.id for t in self.tracks() if t.id not in seen and in_scope(t.path)]
         with self._lock:
             db = self._conn()
             db.executemany("DELETE FROM tracks WHERE id = ?", [(i,) for i in gone])

@@ -295,25 +295,33 @@ def attach_sheets(story: Story, folder: str | os.PathLike) -> int:
     return matched
 
 
+def story_to_dict(story: Story) -> dict:
+    """The plain data a story file holds (format "aura-story", version 1). Playlist packages carry it too."""
+    return {"format": "aura-story", "version": 1, "album": story.album, "root": story.root,
+            "tracks": [asdict(t) for t in story.tracks]}
+
+
 def save_story(story: Story, path: str | os.PathLike) -> None:
     """JSON, UTF-8, indent 2 - readable and editable by hand."""
-    data = {"format": "aura-story", "version": 1, "album": story.album, "root": story.root,
-            "tracks": [asdict(t) for t in story.tracks]}
-    atomic_write_text(path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+    atomic_write_text(path, json.dumps(story_to_dict(story), ensure_ascii=False, indent=2) + "\n")
 
 
-def load_story(path: str | os.PathLike, library: Optional[Library] = None) -> Story:
-    """Read a story file. Unknown keys are ignored (and logged); a story pack without a root gets its folder.
-    With a library, tracks whose files have moved are relinked (see relink_story)."""
-    data = json.loads(read_text(path))
+def story_from_dict(data: Any, source: str = "story") -> Story:
+    """A Story from story-file data (see story_to_dict). Unknown keys are ignored (and logged); a track without
+    a track_id or a title is an error. `source` names where the data came from (a path, a package member), so
+    the messages say which file to fix. Nothing is relinked here: see load_story / relink_story."""
+    if not isinstance(data, dict):
+        raise ValueError(f"{source}: not a story (expected a JSON object)")
     known = {f.name for f in fields(StoryTrack)}
     tracks: list[StoryTrack] = []
     for i, entry in enumerate(data.get("tracks") or []):
+        if not isinstance(entry, dict):
+            raise ValueError(f"{source}: track {i + 1} is not a JSON object")
         extra = sorted(set(entry) - known)
         if extra:
-            log.warning("%s track %d: ignoring unknown keys %s", path, i + 1, ", ".join(extra))
+            log.warning("%s track %d: ignoring unknown keys %s", source, i + 1, ", ".join(extra))
         if not entry.get("track_id") or "title" not in entry:
-            raise ValueError(f"{path}: track {i + 1} needs a track_id and a title")
+            raise ValueError(f"{source}: track {i + 1} needs a track_id and a title")
         kwargs = {k: entry[k] for k in known if k in entry}
         chars = kwargs.get("characters") or []
         kwargs["characters"] = [chars] if isinstance(chars, str) else [str(c) for c in chars]
@@ -321,10 +329,15 @@ def load_story(path: str | os.PathLike, library: Optional[Library] = None) -> St
             if key in kwargs:
                 kwargs[key] = "" if kwargs[key] is None else str(kwargs[key])
         tracks.append(StoryTrack(**kwargs))
-    root = str(data.get("root") or "")
-    if not root and Path(path).name == STORY_PACK_NAME:
-        root = os.path.dirname(os.path.abspath(path))
-    story = Story(album=str(data.get("album") or ""), root=root, tracks=tracks)
+    return Story(album=str(data.get("album") or ""), root=str(data.get("root") or ""), tracks=tracks)
+
+
+def load_story(path: str | os.PathLike, library: Optional[Library] = None) -> Story:
+    """Read a story file. Unknown keys are ignored (and logged); a story pack without a root gets its folder.
+    With a library, tracks whose files have moved are relinked (see relink_story)."""
+    story = story_from_dict(json.loads(read_text(path)), str(path))
+    if not story.root and Path(path).name == STORY_PACK_NAME:
+        story.root = os.path.dirname(os.path.abspath(path))
     if library is not None:
         relinked = relink_story(story, library)
         if relinked:

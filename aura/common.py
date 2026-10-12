@@ -117,6 +117,31 @@ def atomic_write_text(path: str | os.PathLike, text: str) -> Path:
     return target
 
 
+def atomic_write_bytes(path: str | os.PathLike, data: bytes) -> Path:
+    """Write a binary file (an imported break's audio, say) so that a crash leaves the old file or the new one.
+
+    Same shape as atomic_write_text: a temporary file beside the target, renamed over it.
+    """
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = temp_path_for(target)
+    with open(tmp, "wb") as fh:
+        fh.write(data)
+        fh.flush()
+        os.fsync(fh.fileno())
+    try:
+        os.replace(tmp, target)
+    except OSError as exc:
+        log.warning("could not replace %s in one step (%s); writing it in place", target, exc)
+        with open(target, "wb") as fh:
+            fh.write(data)
+        try:
+            tmp.unlink()
+        except OSError as exc2:
+            log.warning("could not remove the temporary file %s: %s", tmp, exc2)
+    return target
+
+
 def read_text(path: str | os.PathLike) -> str:
     """Read a text file Bill may have saved from Notepad: UTF-8 with or without a BOM, else Windows-1252."""
     raw = Path(path).read_bytes()

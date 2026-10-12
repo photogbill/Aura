@@ -10,7 +10,7 @@ from aura_test_support import REPO
 
 FORBIDDEN_TOP_LEVEL = ("PySide6", "PySide2", "PyQt5", "PyQt6", "mutagen", "tinytag", "atk", "numpy", "requests")
 MODULES = ("aura", "aura.common", "aura.library", "aura.ingest", "aura.playlist", "aura.story", "aura.script",
-           "aura.breaks", "aura.show", "aura.cli")
+           "aura.breaks", "aura.show", "aura.cli", "aura.bundle", "aura.sources", "aura.convert")
 
 
 class PackageRuleTests(unittest.TestCase):

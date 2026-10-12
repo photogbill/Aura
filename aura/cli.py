@@ -2,10 +2,14 @@
 """Command line, for using and checking the engine without ATK:
 
     python -m aura scan <folder> [--data DIR] [--ffmpeg PATH] [--no-measure] [--only wav | --prefer wav]
+                        [--no-subfolders]
     python -m aura tracks [--album NAME]
     python -m aura playlist <out.m3u8> [--album NAME]
     python -m aura story-draft <album_root>
     python -m aura script-check <script> [--voice NAME]
+    python -m aura export <out.aura.zip> [--album NAME | --playlist FILE.m3u8] [--name NAME]
+    python -m aura import <package.aura.zip> [--replace] [--dry-run]
+    python -m aura routenote <folder or WAVs...> --out DIR [--subfolders] [--overwrite]
 
 Everything is kept in <repo>/data unless --data says otherwise: never in the user profile.
 """
@@ -21,7 +25,7 @@ from typing import Callable
 from . import __version__
 from .common import read_text
 from .library import Library, preference
-from .playlist import playlists_dir, write_m3u8
+from .playlist import playlists_dir, read_m3u8, write_m3u8
 from .script import STATUSES, lint_script, parse_script, refresh_status
 from .story import STORY_PACK_NAME, attach_sheets, draft_story, save_story, story_path
 
@@ -50,7 +54,8 @@ def cmd_scan(args: argparse.Namespace, data: Path) -> int:
     with Library(data, ffmpeg) as lib:
         only = (args.only,) if args.only else None
         prefer = preference(args.prefer) if args.prefer else None
-        summary = lib.scan(args.folder, progress=print, measure=not args.no_measure, only=only, prefer=prefer)
+        summary = lib.scan(args.folder, progress=print, measure=not args.no_measure, only=only, prefer=prefer,
+                           subfolders=not args.no_subfolders)
         if summary.carried:
             from .breaks import BreakStore, relink_breaks
             relink_breaks(BreakStore(data), summary.carried)
@@ -143,6 +148,93 @@ def cmd_script_check(args: argparse.Namespace, data: Path) -> int:
     return 0
 
 
+def cmd_export(args: argparse.Namespace, data: Path) -> int:
+    from .breaks import BreakStore
+    from .bundle import export_bundle
+    ffmpeg = _ffmpeg(args)
+    with Library(data, ffmpeg) as lib:
+        if args.playlist:
+            ids = []
+            for entry in read_m3u8(args.playlist):
+                track = lib.track_for_path(entry["path"])
+                if track is None:
+                    print(f"not in the library, left out: {entry['path']}")
+                else:
+                    ids.append(track.id)
+        else:
+            ids = [t.id for t in lib.tracks(album=args.album)]
+        if not ids:
+            print("No songs to export. Scan their folder first: python -m aura scan <folder>")
+            return 1
+        summary = export_bundle(lib, BreakStore(data, ffmpeg), ids, args.out, name=args.name or "",
+                                ffmpeg=ffmpeg, progress=print)
+    if summary.cancelled:
+        return 1
+    print(f"Wrote {summary.path} ({summary.bytes:,} bytes): {summary.songs} song(s), {summary.transcripts} "
+          f"transcript(s), {summary.breaks} break(s) - {summary.audio} with audio ({summary.converted} converted "
+          f"to MP3) - {summary.own_takes} own take(s), {summary.stories} story(ies). The songs are not in it.")
+    for line in summary.unreadable:
+        print(f"unreadable (no fingerprint; it can still be found by name): {line}")
+    for warning in summary.warnings:
+        print(f"warning: {warning}")
+    return 0
+
+
+def cmd_import(args: argparse.Namespace, data: Path) -> int:
+    from .breaks import BreakStore
+    from .bundle import MATCH_LABELS, apply_import, plan_import, read_bundle
+    bundle = read_bundle(args.package)
+    with Library(data, _ffmpeg(args)) as lib:
+        plan = plan_import(bundle, lib)
+        for s in plan.songs:
+            print(f"  {MATCH_LABELS.get(s.how, s.how):<26} {s.title}  ->  {s.local_path or '-'}")
+        print(f"{plan.found()} of {len(plan.songs)} song(s) of {plan.name!r} found here; "
+              f"{plan.audio} break audio file(s), voices: {', '.join(plan.voices) or '-'}.")
+        if args.dry_run:
+            return 0
+        if not plan.found():
+            print("Nothing to attach to: scan the folder holding these songs first, then import again.")
+            return 1
+        summary = apply_import(bundle, plan, lib, BreakStore(data, _ffmpeg(args)),
+                               mode="replace" if args.replace else "fill", progress=print)
+    print(f"Imported ({summary.mode}): {summary.songs_updated} song(s) updated, {summary.transcripts_added} "
+          f"transcript(s) added ({summary.transcripts_kept} kept), breaks {summary.breaks_added} added / "
+          f"{summary.breaks_replaced} replaced / {summary.breaks_kept} kept, {summary.audio_files} audio file(s), "
+          f"own takes {summary.own_takes_added} added / {summary.own_takes_kept} kept, "
+          f"{summary.stories_saved} story(ies) saved.")
+    if summary.playlist:
+        print(f"Playlist: {summary.playlist}")
+    for line in summary.stories_kept:
+        print(f"story kept: {line}")
+    for line in summary.songs_missing:
+        print(f"not in this library: {line}")
+    for warning in summary.warnings:
+        print(f"warning: {warning}")
+    return 0
+
+
+def cmd_routenote(args: argparse.Namespace, data: Path) -> int:
+    from .convert import convert_batch
+    from .library import find_audio
+    ffmpeg = _ffmpeg(args)
+    if not ffmpeg:
+        print("FFmpeg is needed to convert audio and was not found (--ffmpeg PATH).")
+        return 2
+    paths: list[str] = []
+    for item in args.inputs:
+        p = Path(item)
+        paths.extend(find_audio(p, subfolders=args.subfolders) if p.is_dir() else [str(p)])
+    summary = convert_batch(paths, args.out, ffmpeg=ffmpeg, overwrite=args.overwrite, progress=print)
+    for i in summary.items:
+        if i.status in ("converted", "failed"):
+            print(f"{i.status:<9} {i.src} -> {i.dst or '-'}  {'; '.join(i.changes) or i.error}")
+        if i.warning:
+            print(f"warning   {i.src}: {i.warning}")
+    print(f"{summary.count('converted')} converted, {summary.count('kept')} already done, "
+          f"{summary.count('failed')} failed, {summary.count('skipped')} not WAV; resampler {summary.resampler}.")
+    return 1 if summary.count("failed") else 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--data", metavar="DIR", help="data folder (default: <repo>/data)")
@@ -155,6 +247,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("scan", parents=[common], help="index the audio files under a folder")
     p.add_argument("folder")
     p.add_argument("--no-measure", action="store_true", help="skip loudness measurement (much faster)")
+    p.add_argument("--no-subfolders", action="store_true", help="this folder only, not the folders below it")
     kind = p.add_mutually_exclusive_group()
     kind.add_argument("--only", metavar="TYPE", help="index only this file type, e.g. wav")
     kind.add_argument("--prefer", metavar="TYPE",
@@ -172,12 +265,29 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("script-check", parents=[common], help="check a script file: statuses, stale, problems")
     p.add_argument("script", help="'casual', an album slug, or a path to a script .txt")
     p.add_argument("--voice", default="", help="the current host voice (breaks rendered with another read stale)")
+    p = sub.add_parser("export", parents=[common], help="write a playlist package (everything but the songs)")
+    p.add_argument("out", help="the package file (.aura.zip is added when it does not end in .zip)")
+    which = p.add_mutually_exclusive_group()
+    which.add_argument("--album", help="only this album (default: every song in the library)")
+    which.add_argument("--playlist", metavar="FILE", help="the songs of this .m3u8, in its order")
+    p.add_argument("--name", help="the playlist's name (default: the file name)")
+    p = sub.add_parser("import", parents=[common], help="bring a playlist package's work in for songs here")
+    p.add_argument("package", help="the .aura.zip")
+    p.add_argument("--replace", action="store_true", help="the package wins (default: keep what is here)")
+    p.add_argument("--dry-run", action="store_true", help="only show which songs would be found, and how")
+    p = sub.add_parser("routenote", parents=[common],
+                       help="WAVs to RouteNote's FLAC (stereo, 16-bit, 44.1 kHz), organized by album")
+    p.add_argument("inputs", nargs="+", help="folders and/or WAV files")
+    p.add_argument("--out", required=True, help="where the copies go (<out>/<album>/<song>.flac)")
+    p.add_argument("--subfolders", action="store_true", help="also the folders below each folder given")
+    p.add_argument("--overwrite", action="store_true", help="convert again even when a good copy is there")
     return parser
 
 
 _COMMANDS: dict[str, Callable[[argparse.Namespace, Path], int]] = {
     "scan": cmd_scan, "tracks": cmd_tracks, "playlist": cmd_playlist,
     "story-draft": cmd_story_draft, "script-check": cmd_script_check,
+    "export": cmd_export, "import": cmd_import, "routenote": cmd_routenote,
 }
 
 

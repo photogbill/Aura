@@ -35,10 +35,14 @@ def _one_line(text: str) -> str:
     return " ".join(str(text).split())
 
 
-def write_m3u8(path: str | os.PathLike, tracks: list[Track] | list[dict], relative: bool = True) -> Path:
-    """Write #EXTM3U with one "#EXTINF:<secs>,<artist - title>" line per entry, UTF-8. Returns the path."""
-    out = Path(path)
-    folder = os.path.abspath(out.parent)
+def m3u8_text(tracks: list[Track] | list[dict], folder: str | os.PathLike | None = None,
+              relative: bool = True) -> str:
+    """The text of an extended M3U: #EXTM3U, then "#EXTINF:<secs>,<artist - title>" and the path per entry.
+
+    Paths under `folder` are written relative to it when `relative`; with no folder every path is absolute
+    (the copy of a playlist that travels inside a playlist package, which holds no songs to be relative to).
+    """
+    base = os.path.abspath(folder) if folder else None
     lines = ["#EXTM3U"]
     for entry in tracks:
         item = _item(entry)
@@ -53,8 +57,14 @@ def write_m3u8(path: str | os.PathLike, tracks: list[Track] | list[dict], relati
         label = f"{_one_line(item['artist'])} - {title}" if item["artist"] else title
         lines.append(f"#EXTINF:{seconds if seconds > 0 else -1},{label}")
         target = os.path.abspath(item["path"])
-        lines.append(os.path.relpath(target, folder) if relative and is_under(target, folder) else target)
-    return atomic_write_text(out, "\n".join(lines) + "\n")
+        lines.append(os.path.relpath(target, base) if relative and base and is_under(target, base) else target)
+    return "\n".join(lines) + "\n"
+
+
+def write_m3u8(path: str | os.PathLike, tracks: list[Track] | list[dict], relative: bool = True) -> Path:
+    """Write #EXTM3U with one "#EXTINF:<secs>,<artist - title>" line per entry, UTF-8. Returns the path."""
+    out = Path(path)
+    return atomic_write_text(out, m3u8_text(tracks, out.parent, relative))
 
 
 def _resolve(entry: str, folder: str) -> str:
